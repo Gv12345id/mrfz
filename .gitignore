@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# 游戏素材：全部由使用者本机截图生成，不入库
+assets/templates/*
+assets/captures/*
+!assets/templates/.gitkeep
+!assets/captures/.gitkeep
+
+# 本机环境相关
+config/config.local.yaml
