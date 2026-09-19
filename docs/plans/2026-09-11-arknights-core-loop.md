@@ -1959,9 +1959,7 @@ CLOSE_ELEMENTS = ("common.close", "common.confirm")
 BACK_ELEMENTS = ("common.back_button",)
 
 
-def recover_to_home(
-    ctx: Context, *, home_page: str = "main", max_attempts: int = 8
-) -> bool:
+def recover_to_home(ctx: Context, *, home_page: str = "main", max_attempts: int = 8) -> bool:
     for _ in range(max_attempts):
         ctx.check_stop()
         if ctx.vision.page(ctx.refresh()).page == home_page:
@@ -2302,9 +2300,7 @@ class ScriptedDevice:
             target, after = rule
             if self._dwell >= after:
                 self._go(target)
-        return Frame(
-            image=self._pages[self._current], raw_size=(1280, 720), ts=time.monotonic()
-        )
+        return Frame(image=self._pages[self._current], raw_size=(1280, 720), ts=time.monotonic())
 
     def tap(self, x: int, y: int) -> None:
         self.taps.append((x, y))
@@ -2366,8 +2362,12 @@ SANITY_ROI = (40, 20, 24, 24)
 PAGE_SPECS = {
     "main": PageSpec("main", ("main.terminal_entry",), min_score=0.75, margin=0.05),
     "level_select": PageSpec("level_select", ("stage.stage_1_7",), min_score=0.75, margin=0.05),
-    "combat_confirm": PageSpec("combat_confirm", ("combat.start_button",), min_score=0.75, margin=0.05),
-    "combat_running": PageSpec("combat_running", ("combat.in_progress",), min_score=0.75, margin=0.05),
+    "combat_confirm": PageSpec(
+        "combat_confirm", ("combat.start_button",), min_score=0.75, margin=0.05
+    ),
+    "combat_running": PageSpec(
+        "combat_running", ("combat.in_progress",), min_score=0.75, margin=0.05
+    ),
     "combat_result": PageSpec("combat_result", ("result.confirm",), min_score=0.75, margin=0.05),
 }
 
@@ -2379,9 +2379,7 @@ def _build(tmp_path: Path, sanity_values):
         assert cv2.imwrite(str(tmp_path / f"{name}.png"), synth.make_patch(seed))
         elements[name] = ElementSpec(name, (x, y, 24, 24), template=f"{name}.png", threshold=0.9)
         boxes[name] = (x, y, 24, 24)
-    elements["sanity.value"] = ElementSpec(
-        "sanity.value", SANITY_ROI, kind="ocr_int", scale=1
-    )
+    elements["sanity.value"] = ElementSpec("sanity.value", SANITY_ROI, kind="ocr_int", scale=1)
 
     def render(names):
         image = synth.make_frame()
@@ -2638,9 +2636,7 @@ def load_frame_for_annotation(path: Path) -> np.ndarray:
     return normalize(image)
 
 
-def crop_and_save(
-    frame_path: Path, rect: tuple[int, int, int, int], out_path: Path
-) -> Path:
+def crop_and_save(frame_path: Path, rect: tuple[int, int, int, int], out_path: Path) -> Path:
     x, y, width, height = validate_roi(Path(out_path).stem, rect)
     image = load_frame_for_annotation(frame_path)
     out_path = Path(out_path)
@@ -2908,11 +2904,16 @@ def test_crop_command_writes_template_and_element(tmp_path: Path):
         app,
         [
             "crop",
-            "--frame", str(frame),
-            "--rect", "100,200,40,30",
-            "--name", "main.terminal",
-            "--elements", str(elements),
-            "--templates-dir", str(templates),
+            "--frame",
+            str(frame),
+            "--rect",
+            "100,200,40,30",
+            "--name",
+            "main.terminal",
+            "--elements",
+            str(elements),
+            "--templates-dir",
+            str(templates),
         ],
     )
     assert result.exit_code == 0, result.stdout
@@ -2927,11 +2928,16 @@ def test_crop_command_rejects_malformed_rect(tmp_path: Path):
         app,
         [
             "crop",
-            "--frame", str(frame),
-            "--rect", "abc",
-            "--name", "x",
-            "--elements", str(tmp_path / "e.yaml"),
-            "--templates-dir", str(tmp_path / "t"),
+            "--frame",
+            str(frame),
+            "--rect",
+            "abc",
+            "--name",
+            "x",
+            "--elements",
+            str(tmp_path / "e.yaml"),
+            "--templates-dir",
+            str(tmp_path / "t"),
         ],
     )
     assert result.exit_code == 1
@@ -3085,9 +3091,7 @@ def run(
     if dry_run:
         typer.echo("dry-run：只识别，不点击")
         result = ctx.vision.page(ctx.refresh())
-        typer.echo(
-            f"当前页面: {result.page} certain={result.certain} score={result.score:.3f}"
-        )
+        typer.echo(f"当前页面: {result.page} certain={result.certain} score={result.score:.3f}")
         return
 
     from .recovery import recover_to_home

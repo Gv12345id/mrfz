@@ -62,13 +62,15 @@ IO 层               CaptureBackend(截图) / InputBackend(点击)
 ```python
 @dataclass(frozen=True)
 class Frame:
-    image: np.ndarray          # BGR，已缩放至 1280x720 逻辑坐标系
+    image: np.ndarray  # BGR，已缩放至 1280x720 逻辑坐标系
     raw_size: tuple[int, int]  # 设备原始分辨率
     ts: float
+
 
 class CaptureBackend(Protocol):
     def capture(self) -> Frame: ...
     def close(self) -> None: ...
+
 
 class InputBackend(Protocol):
     def tap(self, x: int, y: int) -> None: ...
@@ -92,12 +94,14 @@ class Match:
     bbox: tuple[int, int, int, int]
     score: float
 
+
 @dataclass(frozen=True)
 class PageResult:
     page: str | None
     score: float
     runner_up: str | None
     certain: bool
+
 
 class Vision:
     def find(self, element: str, frame: Frame) -> Match | None: ...
@@ -142,6 +146,7 @@ class Context:
 ```python
 class Task(Protocol):
     name: str
+
     def run(self, ctx: Context) -> TaskResult: ...
 ```
 

@@ -1,0 +1,17 @@
+# 明日方舟 Agent 运行配置（本文件入库；本机私有覆盖写 config.local.yaml）
+
+mcp:
+  # MaaMCP：基于 MaaFramework 的 MCP server，提供 ADB 设备控制能力
+  command: maa-mcp
+  args: []
+  env: {}
+  startup_timeout_s: 180.0
+  call_timeout_s: 90.0
+
+device:
+  # 设备名/地址匹配片段；留空则仅在只发现一台设备时自动选中
+  match: null
+  # 逻辑坐标系（16:9），设备分辨率非 16:9 时拒绝运行
+  logical_width: 1280
+  logical_height: 720
+  click_duration_ms: 50

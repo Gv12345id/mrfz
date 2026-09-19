@@ -1,0 +1,22 @@
+# 明日方舟自我进化 Agent · 项目级 Codex 配置
+# 作用域：本仓库（E:\Codex\arknights-auto）。个人全局默认仍在 ~/.codex/config.toml。
+# 架构见 AGENTS.md，四阶段门禁见 PLANS.md。
+
+[features]
+# 多 Agent 协作：主 Agent 可以派发子 Agent，各 Agent 共享同一工作区与文件系统。
+multi_agent = true
+# 启用基于「Agent 角色文件」的多 Agent v2：读取 .codex/agents/*.toml 定义的角色。
+# 并发上限可用 [features.multi_agent_v2] 里的 max_concurrent_threads_per_session 收紧（默认较宽）。
+multi_agent_v2 = true
+
+[mcp_servers.maa]
+# MaaMCP：Agent 与 MAA 之间的唯一通道（桥接层只做 schema 校验与会话转发）。
+# 超时字段与 config/config.yaml 的 mcp 段保持一致：startup_timeout_s=180, call_timeout_s=90。
+# 注意：maa-mcp 由本仓库的 venv 安装，系统 PATH 里没有，所以这里写 venv 内的绝对路径。
+# 换机器时改成该机器 venv 下的 Scripts/maa-mcp.exe 即可。
+command = "E:/Codex/arknights-auto/.venv/Scripts/maa-mcp.exe"
+args = []
+startup_timeout_sec = 180
+tool_timeout_sec = 90
+
+# 设备地址、模拟器端口等本机私有信息写在 config/config.local.yaml，不写进本文件。
