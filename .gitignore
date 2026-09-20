@@ -11,6 +11,13 @@ artifacts/
 .coverage
 coverage.xml
 
+# 模型权重不入库（PLANS.md 阶段 2 验收 6）
+models/
+# Ultralytics 预训练权重（COCO）与自行下载的权重目录同样不入库
+weights/
+yolov8n.pt
+yolo11n.pt
+
 # 游戏素材：全部由使用者本机截图生成，不入库
 assets/templates/*
 assets/captures/*
@@ -18,6 +25,8 @@ assets/captures/*
 !assets/captures/.gitkeep
 # 真机集成测试的参考帧同样属于游戏素材（本机录制，不入库）
 tests/fixtures/device/*.png
+# 阶段 2 的 holdout 帧同理（只入库摘要清单 tests/fixtures/perception/frames.sha256）
+tests/fixtures/perception/*.png
 
 # 本机环境相关
 config/config.local.yaml
