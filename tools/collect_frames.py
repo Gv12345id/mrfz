@@ -15,8 +15,11 @@
 
 用法::
 
-    .\\.venv\\Scripts\\python.exe tools\\collect_frames.py --frames 100 --interval-ms 500 \\
-        --screen-context main --out-dir runs/phase2 --name annotation_100
+    # 战斗窗口采集：间隔 0 = 能多快就多快（约 0.09s/帧，400 帧 ≈ 36s），
+    # --max-seconds 是硬时限，到点就停，方便对时间做承诺。
+    .\\.venv\\Scripts\\python.exe tools\\collect_frames.py --frames 400 --interval-ms 0 \\
+        --max-seconds 45 --screen-context battle --out-dir runs/phase2 --name annotation_400x \\
+        --reference-frame <一张战斗帧> --reference-threshold 0.35 --min-mean-brightness 40
 """
 
 from __future__ import annotations
@@ -32,9 +35,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import cv2
+
 from arknights_agent.config import load_settings
 from arknights_agent.device.maa_via_mcp import MaaMcpDevice
-from arknights_agent.imaging import Frame, size_of, write_bgr
+from arknights_agent.imaging import Frame, diff_ratio, read_bgr, size_of, write_bgr
 from arknights_agent.mcp.client import McpStdioClient
 
 LOCAL_TZ = timezone(timedelta(hours=8))
@@ -56,6 +61,8 @@ def frame_record(
     controller_id: str,
     screen_context: str,
     result: str = "ok",
+    mean_brightness: float | None = None,
+    reference_diff: float | None = None,
 ) -> dict[str, Any]:
     """构造一条逐帧记录。
 
@@ -75,6 +82,7 @@ def frame_record(
         "sha256": sha256,
         "captured_at": captured_at.isoformat(),
         "screen_context": screen_context,
+        "stats": {"mean_brightness": mean_brightness, "reference_diff": reference_diff},
         "labels": [],
     }
 
@@ -91,7 +99,8 @@ def summarize(
 
     ok = [item for item in records if item["result"] == "ok"]
     elapsed = [float(item["elapsed_ms"]) for item in ok]
-    failures = len(records) - len(ok)
+    skipped = [item for item in records if str(item["result"]).startswith("skip:")]
+    failures = len(records) - len(ok) - len(skipped)
     return {
         "artifact": "annotation",
         "created_at": datetime.now(LOCAL_TZ).isoformat(),
@@ -101,6 +110,8 @@ def summarize(
         "screen_context": screen_context,
         "interval_ms": interval_ms,
         "frames": len(records),
+        "kept": len(ok),
+        "skipped": len(skipped),
         "failures": failures,
         "elapsed_ms_p95": _p95(elapsed) if elapsed else None,
         "elapsed_ms_mean": round(sum(elapsed) / len(elapsed), 3) if elapsed else None,
@@ -128,7 +139,7 @@ def write_annotation(
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{name}.json"
     jsonl_path = out_dir / f"{name}.jsonl"
-    sha_path = out_dir / "frames.sha256"
+    sha_path = out_dir / f"{name}.sha256"
 
     payload = {**meta, "records": list(records)}
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -137,7 +148,11 @@ def write_annotation(
         encoding="utf-8",
     )
     sha_path.write_text(
-        "".join(f"{item['sha256']}  {Path(item['screenshot']).name}\n" for item in records),
+        "".join(
+            f"{item['sha256']}  {Path(item['screenshot']).name}\n"
+            for item in records
+            if item["result"] == "ok"
+        ),
         encoding="utf-8",
     )
     return json_path, jsonl_path, sha_path
@@ -151,6 +166,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-dir", type=Path, default=Path("runs/phase2"), help="输出目录")
     parser.add_argument("--name", default="annotation", help="annotation 文件名（不含扩展名）")
+    parser.add_argument(
+        "--frames-dir",
+        type=Path,
+        default=None,
+        help="帧目录，默认 <out-dir>/frames/<name>（每次采集独立，避免覆盖上一批）",
+    )
+    parser.add_argument(
+        "--reference-frame",
+        type=Path,
+        default=None,
+        help="目标画面参考帧；与它差异过大的帧标为 skip:off-screen",
+    )
+    parser.add_argument(
+        "--reference-threshold",
+        type=float,
+        default=0.35,
+        help="与参考帧的差异上限（diff_ratio），超过即跳过",
+    )
+    parser.add_argument(
+        "--min-mean-brightness",
+        type=float,
+        default=0.0,
+        help="平均亮度下限，低于它视为转场黑屏并跳过",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="本次采集的硬时限（秒），到点即停；0 表示不限",
+    )
     parser.add_argument(
         "--screen-context",
         choices=SCREEN_CONTEXTS,
@@ -166,20 +211,30 @@ async def collect(
     interval_ms: int,
     out_dir: Path,
     screen_context: str,
+    frames_dir: Path | None = None,
+    reference_frame: Path | None = None,
+    reference_threshold: float = 0.35,
+    min_mean_brightness: float = 0.0,
+    max_seconds: float = 0.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """连设备抓帧；任何一次失败都记账，连续失败超上限就提前停。"""
 
     settings = load_settings()
     records: list[dict[str, Any]] = []
-    frames_dir = out_dir / "frames"
+    target_dir = frames_dir if frames_dir is not None else out_dir / "frames"
+    reference: Frame | None = read_bgr(reference_frame) if reference_frame is not None else None
     consecutive_failures = 0
     resolution = "unknown"
     device_name = "unknown"
+    wall_started = time.perf_counter()
 
     async with McpStdioClient(settings.mcp) as client:
         device = await MaaMcpDevice.connect(client, settings.device)
         device_name = device.name
         for index in range(1, frames + 1):
+            if max_seconds > 0 and (time.perf_counter() - wall_started) >= max_seconds:
+                print(f"达到时限 {max_seconds}s，提前停止（已处理 {index - 1} 帧）")
+                break
             started = time.perf_counter()
             try:
                 frame: Frame = await device.screenshot()
@@ -206,7 +261,14 @@ async def collect(
             consecutive_failures = 0
             width, height = size_of(frame)
             resolution = f"{width}x{height}"
-            path = frames_dir / f"frame_{index:04d}.png"
+            brightness = float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())
+            reference_diff = None if reference is None else diff_ratio(reference, frame)
+            skip_reason = ""
+            if brightness < min_mean_brightness:
+                skip_reason = "skip:dark"
+            elif reference_diff is not None and reference_diff > reference_threshold:
+                skip_reason = "skip:off-screen"
+            path = target_dir / f"frame_{index:04d}.png"
             write_bgr(path, frame)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             records.append(
@@ -219,9 +281,15 @@ async def collect(
                     elapsed_ms=(time.perf_counter() - started) * 1000,
                     controller_id=device.controller_id,
                     screen_context=screen_context,
+                    result=skip_reason or "ok",
+                    mean_brightness=round(brightness, 3),
+                    reference_diff=None if reference_diff is None else round(reference_diff, 4),
                 )
             )
-            if index % 10 == 0 or index == frames:
+            if skip_reason:
+                kept = sum(1 for item in records if item["result"] == "ok")
+                print(f"[{index}/{frames}] {skip_reason}（已保留 {kept}）")
+            elif index % 10 == 0 or index == frames:
                 print(f"[{index}/{frames}] {resolution} 已落盘 {path.name}")
             if interval_ms > 0 and index < frames:
                 await asyncio.sleep(interval_ms / 1000)
@@ -238,19 +306,26 @@ async def collect(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    frames_dir = args.frames_dir or (args.out_dir / "frames" / args.name)
     records, meta = asyncio.run(
         collect(
             frames=args.frames,
             interval_ms=args.interval_ms,
             out_dir=args.out_dir,
             screen_context=args.screen_context,
+            frames_dir=frames_dir,
+            reference_frame=args.reference_frame,
+            reference_threshold=args.reference_threshold,
+            min_mean_brightness=args.min_mean_brightness,
+            max_seconds=args.max_seconds,
         )
     )
     json_path, jsonl_path, sha_path = write_annotation(
         records, meta, out_dir=args.out_dir, name=args.name
     )
     print(
-        f"采集完成：{meta['frames']} 帧，失败 {meta['failures']}，"
+        f"采集完成：共 {meta['frames']} 帧，保留 {meta['kept']}，跳过 {meta['skipped']}，"
+        f"失败 {meta['failures']}，"
         f"p95 {meta['elapsed_ms_p95']}ms，分辨率 {meta['resolution']}"
     )
     print(f"已写出：{json_path}")

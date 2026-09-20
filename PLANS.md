@@ -16,9 +16,10 @@
 
 - [x] 阶段 1：环境搭建 —— MCP 调通 MAA，拿到截图、点得准（2026-09-19 门禁通过：`scripts/verify.py --phase 1` 退出码 0，11/11 全绿，详见 `runs/phase1-acceptance.md`）
 - [ ] 阶段 2：感知模块 —— YOLOv8 + OCR → 结构化状态向量
-      （分步进度：**步骤 1/4 完成** 2026-09-19 —— 100 帧只读采集 + 标注流程验证，
-      `runs/phase2/annotation_100.json`；步骤 2-4 待人工把游戏切到战斗界面后继续，
-      详见 `runs/phase2-acceptance.md`）
+      （分步进度 2026-09-19：步骤 1 完成（100 帧只读采集 + 标注流程验证，采集器已升级 v2）；
+      步骤 2 完成（两批合并去重后 426 帧干净战斗帧，`runs/phase2/annotation_400.json`）；
+      步骤 3 完成（`tools/label.py` 自动预标注 + GUI 抽查，426 帧产出 990 个候选框，待人抽查）；
+      步骤 4 未开始。详见 `runs/phase2-acceptance.md`）
 - [ ] 阶段 3：决策模块 —— 多头 DQN + 动作掩码，0-1 关卡可训练
 - [ ] 阶段 4：自主进化循环 —— Analyzer → Coder → 自动重跑验证
 
