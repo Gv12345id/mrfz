@@ -46,11 +46,53 @@ EXPECTED_PHASE1_CHECKS = (
     "click-loop-successes",
 )
 
+EXPECTED_PHASE2_CHECKS = (
+    "static-checks",
+    "offline-tests",
+    "perception-metrics-tests",
+    "state-vector-tests",
+    "enemy-map50",
+    "enemy-recall",
+    "ocr-cost-accuracy",
+    "ocr-cd-accuracy",
+    "state-dim",
+    "perception-latency-p95-ms",
+    "perception-fixtures-hash",
+    "device-state-legal-rate",
+)
+
 
 def test_phase1_check_names_match_plans_acceptance_criteria() -> None:
     """阶段 1 的 check 名一旦改动，PLANS.md 的映射表必须同步。"""
 
     assert tuple(name for name, _ in verify.PHASE_CHECKS[1]) == EXPECTED_PHASE1_CHECKS
+
+
+def test_phase2_check_names_match_plans_acceptance_criteria() -> None:
+    """阶段 2 的 check 名一旦改动，PLANS.md 的映射表必须同步。"""
+
+    assert tuple(name for name, _ in verify.PHASE_CHECKS[2]) == EXPECTED_PHASE2_CHECKS
+
+
+def test_phase2_thresholds_match_plans() -> None:
+    """阈值是门禁的一部分，改它必须同时改 PLANS.md。"""
+
+    assert verify.ENEMY_MAP50_THRESHOLD == 0.75
+    assert verify.ENEMY_RECALL_THRESHOLD == 0.90
+    assert verify.OCR_ACCURACY_THRESHOLD == 0.98
+    assert verify.STATE_VECTOR_DIM == 173
+    assert verify.PERCEPTION_LATENCY_P95_THRESHOLD_MS == 300.0
+    assert verify.DEVICE_STATE_FRAMES == 50
+
+
+def test_phase2_missing_reports_fail_instead_of_passing(tmp_path: Path) -> None:
+    """产物缺失时必须判 fail 并写清原因，不能因为读不到就返回通过。"""
+
+    missing = tmp_path / "perception_metrics.json"
+    value, problem = verify.read_json_number(missing, "enemy_map50")
+
+    assert value is None
+    assert "缺少" in problem
 
 
 def test_report_matches_plans_json_contract() -> None:
@@ -170,3 +212,68 @@ def test_number_field_rejects_bool_and_missing() -> None:
     assert verify.number_field({"p95_ms": 12.5}, "p95_ms") == 12.5
     assert verify.number_field({"ok": True}, "ok") is None
     assert verify.number_field({}, "p95_ms") is None
+
+
+DIGEST_A = "a" * 64
+DIGEST_B = "b" * 64
+
+
+def test_parse_sha256_manifest_skips_blanks_and_comments() -> None:
+    text = f"# holdout 帧清单\n\n{DIGEST_A}  frame_0001.png\n{DIGEST_B}\tframe_0002.png\n"
+
+    assert verify.parse_sha256_manifest(text) == [
+        (DIGEST_A, "frame_0001.png"),
+        (DIGEST_B, "frame_0002.png"),
+    ]
+
+
+def test_parse_sha256_manifest_lowercases_digest() -> None:
+    assert verify.parse_sha256_manifest(f"{'A' * 64}  frame_0001.png") == [
+        (DIGEST_A, "frame_0001.png")
+    ]
+
+
+def test_parse_sha256_manifest_rejects_broken_lines() -> None:
+    """清单写坏了要报错，不能静默少校验几个文件。"""
+
+    with pytest.raises(ValueError, match="第 1 行"):
+        verify.parse_sha256_manifest("不是摘要  frame_0001.png")
+    with pytest.raises(ValueError, match="第 1 行"):
+        verify.parse_sha256_manifest(f"{DIGEST_A}  ")
+    with pytest.raises(ValueError, match="没有任何条目"):
+        verify.parse_sha256_manifest("# 只有注释\n")
+
+
+def test_nested_number_walks_mapping_path() -> None:
+    assert verify.nested_number({"cd_field": {"accuracy": 0.5}}, "cd_field", "accuracy") == 0.5
+    assert verify.nested_number({"cd_field": {"accuracy": True}}, "cd_field", "accuracy") is None
+    assert verify.nested_number({"cd_field": "pending"}, "cd_field", "accuracy") is None
+    assert verify.nested_number({}, "cd_field", "accuracy") is None
+
+
+def test_verify_manifest_checks_digest_and_reports_missing(tmp_path: Path) -> None:
+    present = tmp_path / "frame_0001.png"
+    present.write_bytes(b"frame-1")
+    digest = verify.file_sha256(present)
+    entries = [
+        (digest, "frame_0001.png"),
+        (DIGEST_B, "frame_0002.png"),
+        (DIGEST_A, "frame_0001.png"),
+    ]
+
+    checked, problems = verify.verify_manifest(tmp_path, entries)
+
+    assert checked == 1
+    assert any("缺少 frame_0002.png" in problem for problem in problems)
+    assert any("摘要不一致" in problem for problem in problems)
+
+
+def test_verify_manifest_accepts_matching_digest(tmp_path: Path) -> None:
+    target = tmp_path / "frame_0009.png"
+    target.write_bytes(b"frame-9")
+
+    checked, problems = verify.verify_manifest(
+        tmp_path, [(verify.file_sha256(target), "frame_0009.png")]
+    )
+
+    assert (checked, problems) == (1, [])

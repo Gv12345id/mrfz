@@ -18,7 +18,14 @@ r"""阶段门禁入口：`python scripts/verify.py --phase N`。
 真机类 check 在拿不到设备时**如实判 fail**（`detail` 写明原因），不 skip、
 不放宽阈值：门禁宁可变红，也不给假绿灯。
 
-用法：`.\.venv\Scripts\python.exe scripts\verify.py --phase 1 [--only a,b]`
+阶段 2 的 check 读三个产物文件（由离线评测 / 真机校验步骤产出，不入库）：
+
+- `runs/phase2/perception_metrics.json`：`enemy_map50`、`enemy_recall`、`state_dim`、
+  `latency_p95_ms`（holdout 集上的 YOLOv8 + `Perception.read` 延迟基准）；
+- `runs/phase2/ocr_report.json`：`accuracy`（费用）、`cd_field.accuracy`（干员 CD）；
+- `runs/phase2/device_state.json`：`frames`、`legal_frames`（真机 50 帧状态向量合法率）。
+
+用法：`.\.venv\Scripts\python.exe scripts\verify.py --phase 1|2 [--only a,b]`
 """
 
 from __future__ import annotations
@@ -51,12 +58,27 @@ INTEGRATION_TEST = ROOT / "tests" / "integration" / "test_device_loop.py"
 RUNS_DIR = ROOT / "runs"
 COVERAGE_JSON = RUNS_DIR / "coverage.json"
 DEVICE_LOOP_METRICS = RUNS_DIR / "phase1" / "device_loop.json"
+# 阶段 2 的三个产物：离线指标、OCR 报告、真机状态校验。
+PERCEPTION_METRICS = RUNS_DIR / "phase2" / "perception_metrics.json"
+OCR_REPORT = RUNS_DIR / "phase2" / "ocr_report.json"
+DEVICE_STATE_METRICS = RUNS_DIR / "phase2" / "device_state.json"
+PERCEPTION_FIXTURE_MANIFEST = ROOT / "tests" / "fixtures" / "perception" / "frames.sha256"
+PERCEPTION_METRICS_TEST = ROOT / "tests" / "test_perception_metrics.py"
+STATE_VECTOR_TEST = ROOT / "tests" / "test_state_vector.py"
 
 # 阈值来自 PLANS.md 阶段 1 验收标准；改阈值必须同时改 PLANS.md 并说明理由。
 MIN_COVERAGE_PERCENT = 80.0
 SCREENSHOT_P95_THRESHOLD_MS = 1500.0
 DEVICE_LOOP_FRAMES = 100
 DEVICE_LOOP_CLICKS = 20
+
+# 阈值来自 PLANS.md 阶段 2 验收标准（2/3/4/5）；同上，改阈值必须同步 PLANS.md。
+ENEMY_MAP50_THRESHOLD = 0.75
+ENEMY_RECALL_THRESHOLD = 0.90
+OCR_ACCURACY_THRESHOLD = 0.98
+STATE_VECTOR_DIM = 173
+PERCEPTION_LATENCY_P95_THRESHOLD_MS = 300.0
+DEVICE_STATE_FRAMES = 50
 
 # 阶段 1 必须锁定的 MCP 工具（见 docs/specs/2026-09-19-mcp-tool-schema.md）。
 REQUIRED_TOOLS = ("find_adb_device_list", "connect_adb_device", "screencap", "click", "swipe")
@@ -70,6 +92,7 @@ SCHEMA_PROBE_TIMEOUT_S = 240.0
 
 LOCAL_TZ = timezone(timedelta(hours=8))
 SHA256_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
+SHA256_HEX_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 PYTEST_PASSED_PATTERN = re.compile(r"(\d+) passed")
 
 
@@ -234,6 +257,52 @@ def documented_schema_hash(doc_text: str) -> str | None:
 
     match = SHA256_PATTERN.search(doc_text)
     return match.group(0) if match else None
+
+
+def parse_sha256_manifest(text: str) -> list[tuple[str, str]]:
+    """解析 `sha256sum` 风格的清单：每行 `<64 位十六进制摘要>  <路径>`。
+
+    空行与 `#` 注释忽略。格式不对的行**抛 ValueError**：清单写坏了要让门禁变红，
+    而不是静默少校验几个文件，给出假绿灯。
+    """
+
+    entries: list[tuple[str, str]] = []
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or SHA256_HEX_PATTERN.fullmatch(parts[0]) is None:
+            raise ValueError(f"第 {number} 行不是 '<sha256>  <path>'：{raw_line!r}")
+        digest, path = parts[0], parts[1].strip()
+        if not path:
+            raise ValueError(f"第 {number} 行不是 '<sha256>  <path>'：{raw_line!r}")
+        entries.append((digest.lower(), path))
+    if not entries:
+        raise ValueError("清单里没有任何条目")
+    return entries
+
+
+def nested_number(data: Mapping[str, Any], *keys: str) -> float | None:
+    """按路径取嵌套数值；任一层缺失或不是数值（bool 不算）时返回 None。"""
+
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    if isinstance(current, bool) or not isinstance(current, (int, float)):
+        return None
+    return float(current)
+
+
+def display_path(path: Path) -> str:
+    """相对仓库根的展示路径；不在仓库里时原样返回（测试用临时目录会走到这里）。"""
+
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +666,235 @@ def check_click_loop(context: CheckContext) -> CheckResult:
     return CheckResult(name, passed, detail, confirmed, DEVICE_LOOP_CLICKS)
 
 
+# --------------------------------------------------------------------------- #
+# 阶段 2 的 check
+# --------------------------------------------------------------------------- #
+
+
+def file_sha256(path: Path) -> str:
+    """文件内容的 sha256；分块读，避免把大文件一次性读进内存。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_manifest(base_dir: Path, entries: Sequence[tuple[str, str]]) -> tuple[int, list[str]]:
+    """逐个校验清单条目，返回 (通过数, 问题列表)。
+
+    相对路径按 `base_dir` 解析（等价于在清单所在目录执行 `sha256sum -c`）。
+    """
+
+    checked = 0
+    problems: list[str] = []
+    for expected, relative in entries:
+        target = Path(relative)
+        if not target.is_absolute():
+            target = base_dir / target
+        if not target.is_file():
+            problems.append(f"缺少 {relative}")
+            continue
+        actual = file_sha256(target)
+        if actual != expected:
+            problems.append(f"{relative} 摘要不一致（清单 {expected[:12]}…，实际 {actual[:12]}…）")
+            continue
+        checked += 1
+    return checked, problems
+
+
+def read_json_report(path: Path) -> tuple[Mapping[str, Any] | None, str]:
+    """读一个 JSON 产物；缺失或坏掉时返回 (None, 原因)，由调用方判 fail。"""
+
+    relative = display_path(path)
+    if not path.is_file():
+        return None, f"缺少 {relative}（由离线评测/真机校验步骤产出，不入库）"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"{relative} 无法解析：{exc}"
+    if not isinstance(data, Mapping):
+        return None, f"{relative} 顶层不是对象"
+    return data, ""
+
+
+def read_json_number(path: Path, *keys: str) -> tuple[float | None, str]:
+    """读产物里的嵌套数值；返回 (值, 原因)，值为 None 时原因非空。"""
+
+    data, problem = read_json_report(path)
+    if data is None:
+        return None, problem
+    value = nested_number(data, *keys)
+    if value is None:
+        return None, f"{display_path(path)} 缺少数值字段 {'.'.join(keys)}"
+    return value, ""
+
+
+def _metric_at_least(
+    name: str, path: Path, keys: Sequence[str], threshold: float, label: str
+) -> CheckResult:
+    """产物里的数值 ≥ 阈值才算通过。"""
+
+    value, problem = read_json_number(path, *keys)
+    if value is None:
+        return CheckResult(name, False, problem, None, threshold)
+    return CheckResult(name, value >= threshold, f"{label} {value:g}", value, threshold)
+
+
+def _pytest_file(name: str, test_path: Path) -> CheckResult:
+    """按路径跑一个测试文件；缺失即 fail，不静默跳过。"""
+
+    relative = display_path(test_path)
+    if not test_path.is_file():
+        return CheckResult(name, False, f"缺少 {relative}")
+    command = [sys.executable, "-m", "pytest", str(relative), "-q", "-rs"]
+    try:
+        proc = run_command(command, timeout_s=OFFLINE_TESTS_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return CheckResult(name, False, f"{relative} 超时（{OFFLINE_TESTS_TIMEOUT_S}s）")
+    except OSError as exc:
+        return CheckResult(name, False, f"无法启动 pytest：{exc}")
+    if proc.returncode != 0:
+        return CheckResult(
+            name, False, f"pytest {relative} 退出码 {proc.returncode}：{tail(proc.stdout)}"
+        )
+    match = PYTEST_PASSED_PATTERN.search(proc.stdout)
+    passed_count = int(match.group(1)) if match else None
+    return CheckResult(
+        name, True, f"pytest {relative}：{tail(proc.stdout, limit=160)}", passed_count
+    )
+
+
+def check_perception_metrics_tests(_: CheckContext) -> CheckResult:
+    """验收 2：holdout 上的 mAP / 召回 / OCR 准确率门禁测试全绿。"""
+
+    return _pytest_file("perception-metrics-tests", PERCEPTION_METRICS_TEST)
+
+
+def check_state_vector_tests(_: CheckContext) -> CheckResult:
+    """验收 3：状态向量维度、补零/截断与值域测试全绿。"""
+
+    return _pytest_file("state-vector-tests", STATE_VECTOR_TEST)
+
+
+def check_enemy_map50(_: CheckContext) -> CheckResult:
+    """验收 2：holdout 敌人 mAP@50 ≥ 0.75。"""
+
+    return _metric_at_least(
+        "enemy-map50", PERCEPTION_METRICS, ("enemy_map50",), ENEMY_MAP50_THRESHOLD, "mAP@0.5"
+    )
+
+
+def check_enemy_recall(_: CheckContext) -> CheckResult:
+    """验收 2：holdout「战场存在敌人」召回 ≥ 0.90。"""
+
+    return _metric_at_least(
+        "enemy-recall", PERCEPTION_METRICS, ("enemy_recall",), ENEMY_RECALL_THRESHOLD, "召回"
+    )
+
+
+def check_ocr_cost_accuracy(_: CheckContext) -> CheckResult:
+    """验收 2：费用 OCR 整数值准确率 ≥ 0.98。"""
+
+    return _metric_at_least(
+        "ocr-cost-accuracy", OCR_REPORT, ("accuracy",), OCR_ACCURACY_THRESHOLD, "费用准确率"
+    )
+
+
+def check_ocr_cd_accuracy(_: CheckContext) -> CheckResult:
+    """验收 2：干员 CD OCR 整数值准确率 ≥ 0.98。"""
+
+    return _metric_at_least(
+        "ocr-cd-accuracy",
+        OCR_REPORT,
+        ("cd_field", "accuracy"),
+        OCR_ACCURACY_THRESHOLD,
+        "CD 准确率",
+    )
+
+
+def check_state_dim(_: CheckContext) -> CheckResult:
+    """验收 3 / 停止条件：状态向量维度 = 173。"""
+
+    name = "state-dim"
+    value, problem = read_json_number(PERCEPTION_METRICS, "state_dim")
+    if value is None:
+        return CheckResult(name, False, problem, None, STATE_VECTOR_DIM)
+    passed = value == float(STATE_VECTOR_DIM)
+    return CheckResult(
+        name, passed, f"状态向量维度 {int(value)}，要求 {STATE_VECTOR_DIM}", value, STATE_VECTOR_DIM
+    )
+
+
+def check_perception_latency_p95(_: CheckContext) -> CheckResult:
+    """验收 4：单帧 `Perception.read` p95 ≤ 300ms（CPU 基准）。"""
+
+    name = "perception-latency-p95-ms"
+    value, problem = read_json_number(PERCEPTION_METRICS, "latency_p95_ms")
+    if value is None:
+        return CheckResult(name, False, problem, None, PERCEPTION_LATENCY_P95_THRESHOLD_MS)
+    return CheckResult(
+        name,
+        value <= PERCEPTION_LATENCY_P95_THRESHOLD_MS,
+        f"单帧感知 p95 {value:g}ms",
+        value,
+        PERCEPTION_LATENCY_P95_THRESHOLD_MS,
+    )
+
+
+def check_perception_fixtures_hash(_: CheckContext) -> CheckResult:
+    """验收 6：`tests/fixtures/perception/frames.sha256` 与文件一致。"""
+
+    name = "perception-fixtures-hash"
+    relative = display_path(PERCEPTION_FIXTURE_MANIFEST)
+    if not PERCEPTION_FIXTURE_MANIFEST.is_file():
+        return CheckResult(name, False, f"缺少 {relative}（200 帧 holdout 的摘要清单）")
+    try:
+        text = PERCEPTION_FIXTURE_MANIFEST.read_text(encoding="utf-8")
+        entries = parse_sha256_manifest(text)
+    except (OSError, ValueError) as exc:
+        return CheckResult(name, False, f"{relative} 无法解析：{exc}")
+    checked, problems = verify_manifest(PERCEPTION_FIXTURE_MANIFEST.parent, entries)
+    if problems:
+        return CheckResult(
+            name,
+            False,
+            f"{checked}/{len(entries)} 条通过：{tail('；'.join(problems))}",
+            checked,
+            len(entries),
+        )
+    return CheckResult(name, True, f"{checked} 条摘要全部一致", checked, len(entries))
+
+
+def check_device_state_legal_rate(_: CheckContext) -> CheckResult:
+    """验收 5：真机 50 帧状态向量合法率 100%，无异常帧。"""
+
+    name = "device-state-legal-rate"
+    threshold = 1.0
+    data, problem = read_json_report(DEVICE_STATE_METRICS)
+    if data is None:
+        return CheckResult(name, False, f"{problem}；真机状态校验尚未跑", None, threshold)
+    frames = number_field(data, "frames")
+    legal = number_field(data, "legal_frames")
+    if frames is None or legal is None:
+        return CheckResult(
+            name,
+            False,
+            f"{display_path(DEVICE_STATE_METRICS)} 缺少数值字段 frames / legal_frames",
+            None,
+            threshold,
+        )
+    if frames != float(DEVICE_STATE_FRAMES):
+        return CheckResult(
+            name, False, f"校验帧数 {int(frames)}，要求 {DEVICE_STATE_FRAMES}", None, threshold
+        )
+    rate = legal / frames if frames else 0.0
+    return CheckResult(
+        name, rate >= threshold, f"真机 {int(frames)} 帧状态合法 {int(legal)} 帧", rate, threshold
+    )
+
+
 PHASE_CHECKS: dict[int, tuple[tuple[str, Callable[[CheckContext], CheckResult]], ...]] = {
     1: (
         ("static-checks", check_static_checks),
@@ -611,6 +909,20 @@ PHASE_CHECKS: dict[int, tuple[tuple[str, Callable[[CheckContext], CheckResult]],
         ("screenshot-p95-ms", check_screenshot_p95),
         ("click-loop-successes", check_click_loop),
     ),
+    2: (
+        ("static-checks", check_static_checks),
+        ("offline-tests", check_offline_tests),
+        ("perception-metrics-tests", check_perception_metrics_tests),
+        ("state-vector-tests", check_state_vector_tests),
+        ("enemy-map50", check_enemy_map50),
+        ("enemy-recall", check_enemy_recall),
+        ("ocr-cost-accuracy", check_ocr_cost_accuracy),
+        ("ocr-cd-accuracy", check_ocr_cd_accuracy),
+        ("state-dim", check_state_dim),
+        ("perception-latency-p95-ms", check_perception_latency_p95),
+        ("perception-fixtures-hash", check_perception_fixtures_hash),
+        ("device-state-legal-rate", check_device_state_legal_rate),
+    ),
 }
 
 
@@ -624,7 +936,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog="verify.py",
         description="按 PLANS.md 的验收标准跑阶段门禁，输出契约 JSON。",
     )
-    parser.add_argument("--phase", type=int, default=1, help="阶段号（已实现：1）")
+    parser.add_argument("--phase", type=int, default=1, help="阶段号（已实现：1、2）")
     parser.add_argument(
         "--only", default=None, help="只跑指定 check（逗号分隔）；默认跑该阶段全部 check"
     )
@@ -665,7 +977,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.phase not in PHASE_CHECKS:
         print(
             f"阶段 {args.phase} 的门禁尚未实现（已实现：{sorted(PHASE_CHECKS)}）；"
-            "阶段 2-4 的 check 落地后在此注册。",
+            "阶段 3-4 的 check 落地后在此注册。",
             file=sys.stderr,
         )
         return 2
