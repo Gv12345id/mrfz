@@ -108,9 +108,15 @@ def _extract_glyph_boxes(
 
 @dataclass(frozen=True)
 class DigitTemplates:
-    """0–9 的数字模板（布尔图，shape = (10, 高, 宽)）。"""
+    """0–9 的数字模板（布尔图，shape = (10, 高, 宽)）。
+
+    费用区与底部干员卡区**各有一套模板**：两处字号与抗锯齿不同，同一个数字在两处的
+    海明距离实测可达 292 位（远超 120 的匹配阈值），共用一套均值模板会让两边都认不出来。
+    `card_images` 缺失时卡片区退回费用模板——老的 npz（只有 `templates`）因此仍然可用。
+    """
 
     images: NDArray[np.bool_]
+    card_images: NDArray[np.bool_] | None = None
 
     @classmethod
     def load(cls, path: Path = DEFAULT_TEMPLATE_PATH) -> DigitTemplates:
@@ -124,29 +130,60 @@ class DigitTemplates:
             )
         with np.load(path) as data:
             images = np.asarray(data["templates"], dtype=bool)
-        if images.ndim != 3 or images.shape[0] != 10:
-            raise OcrError(f"模板形状应为 (10, H, W)，实际 {images.shape}")
-        return cls(images)
+            cards = (
+                np.asarray(data["card_templates"], dtype=bool) if "card_templates" in data else None
+            )
+        _check_template_shape(images, "templates", path)
+        if cards is not None:
+            _check_template_shape(cards, "card_templates", path)
+        return cls(images, cards)
 
-    def classify(self, glyph: Mask) -> tuple[int, int]:
-        """返回 (数字, 海明距离)。"""
+    @property
+    def has_card_templates(self) -> bool:
+        """是否带卡片区专用模板（假 = 卡片区退回费用模板）。"""
 
-        distances = [int(np.count_nonzero(glyph != template)) for template in self.images]
+        return self.card_images is not None
+
+    def _classify_with(self, bank: NDArray[np.bool_], glyph: Mask) -> tuple[int, int]:
+        distances = [int(np.count_nonzero(glyph != template)) for template in bank]
         best = int(np.argmin(distances))
         return best, distances[best]
 
-    def read_number(self, glyphs: list[Mask]) -> tuple[int | None, list[int]]:
-        """把一串字形拼成整数；任一字形匹配太差就判为不可信（None）。"""
+    def classify(self, glyph: Mask) -> tuple[int, int]:
+        """费用区：返回 (数字, 海明距离)。"""
+
+        return self._classify_with(self.images, glyph)
+
+    def classify_card(self, glyph: Mask) -> tuple[int, int]:
+        """卡片区：返回 (数字, 海明距离)；没有卡片模板时退回费用模板。"""
+
+        bank = self.images if self.card_images is None else self.card_images
+        return self._classify_with(bank, glyph)
+
+    def read_number(
+        self, glyphs: list[Mask], *, card: bool = False
+    ) -> tuple[int | None, list[int]]:
+        """把一串字形拼成整数；任一字形匹配太差就判为不可信（None）。
+
+        `card=True` 用卡片区模板（见 :attr:`card_images`）。
+        """
 
         if not glyphs:
             return None, []
         digits: list[int] = []
         for glyph in glyphs:
-            digit, distance = self.classify(glyph)
+            digit, distance = self.classify_card(glyph) if card else self.classify(glyph)
             if distance > MAX_MATCH_DISTANCE:
                 return None, digits
             digits.append(digit)
         return int("".join(str(digit) for digit in digits)), digits
+
+
+def _check_template_shape(images: NDArray[np.bool_], name: str, path: Path) -> None:
+    """模板必须是 (10, H, W)：少一个数字就等于静默认错，宁可报错。"""
+
+    if images.ndim != 3 or images.shape[0] != 10:
+        raise OcrError(f"{path} 的 {name} 形状应为 (10, H, W)，实际 {images.shape}")
 
 
 def read_cost(
@@ -188,6 +225,10 @@ def read_card_numbers(
     字形按"左边缘间距"分组：同一数字内相邻字形间距约 22–28px，不同卡片之间约 80px 以上，
     所以用中间值 :data:`GLYPH_GROUP_MAX_DELTA` 分段。返回从左到右的读数列表，
     某个数字拼不出来时该位为 None。
+
+    这里用**卡片区模板**（`templates.card_images`）匹配；老 npz 没有卡片模板时退回费用模板，
+    但费用模板对卡片字形的海明距离常常超过阈值，读数会大面积变成 None——那说明该重建模板了
+    （`tools/build_digit_templates.py --source both`）。
     """
 
     results: list[int | None] = []
@@ -209,7 +250,7 @@ def read_card_numbers(
         if not glyphs:
             results.append(None)
             continue
-        results.append(templates.read_number(glyphs)[0])
+        results.append(templates.read_number(glyphs, card=True)[0])
     return results
 
 

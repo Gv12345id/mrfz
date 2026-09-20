@@ -3,22 +3,30 @@
 游戏字体的位图属于游戏素材，按 AGENTS.md §7 不入库；所以仓库里只放这个提取工具，
 模板落到 `.gitignore` 挡住的 `assets/templates/digit_templates.npz`。
 
+**两个区域、两套模板**（`--source`）：右下角费用区 `cost`、底部干员卡区 `cards`。
+两处字号与抗锯齿不同，同一个数字在两处的海明距离实测可达 292 位（阈值只有 120），
+所以各聚各的类、各写各的模板，绝不能合并成一套均值模板。
+
 流程：
 
-1. 在费用 ROI 里抠出白色数字连通域（高 20–46px、宽 6–34px、长宽比 0.25–1.0）；
+1. 在对应区域抠出白色数字连通域（高 20–46px、宽 6–34px、长宽比 0.25–1.0）；
 2. 归一化到 24×32 的二值图，用海明距离贪心聚类；
-3. 打印/导出聚类蒙太奇，人工（或 `--labels`）给出"簇 → 数字"的映射；
-4. 按 0–9 顺序平均成 10 张模板，写进 npz。
+3. 打印/导出聚类蒙太奇，人工给出"簇 → 数字"的映射；
+4. 按 0–9 顺序平均成 10 张模板，写进 npz
+   （`cost` → `templates`，`cards` → `card_templates`）。
 
 用法::
 
-    # 第一步：先看聚类蒙太奇，确认每个簇是哪个数字
-    .\\.venv\\Scripts\\python.exe tools\\build_digit_templates.py ^
-        --annotation runs/phase2/annotation_400.json
+    # 第一步：先看聚类蒙太奇，确认每个簇是哪个数字（两个区域都跑）
+    .\\.venv\\Scripts\\python.exe tools\\build_digit_templates.py \\
+        --annotation runs/phase2/annotation_400.json --source both
 
-    # 第二步：把簇号对应的数字按顺序传进来，生成模板
-    .\\.venv\\Scripts\\python.exe tools\\build_digit_templates.py ^
-        --annotation runs/phase2/annotation_400.json --labels "7,6,1,8,5,0,2,4,3,9,0"
+    # 第二步：按蒙太奇里的簇号补上标签，生成模板
+    .\\.venv\\Scripts\\python.exe tools\\build_digit_templates.py \\
+        --annotation runs/phase2/annotation_400.json --source both \\
+        --labels "7,6,1,8,5,0,2,4,3,9,0" --card-labels "3,1,6,8,0,5,2,9,4,7"
+
+只跑 `--source cards` 时会保留 npz 里已有的费用模板（就地合并，不会把它冲掉）。
 """
 
 from __future__ import annotations
@@ -26,54 +34,48 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-# 费用数字所在的 ROI（x, y, w, h），1280×720 逻辑坐标系。
-COST_ROI: tuple[int, int, int, int] = (1200, 487, 80, 50)
-GLYPH_SIZE = (24, 32)  # (w, h)
+from arknights_agent.perception.ocr import extract_card_glyphs, extract_glyphs
+
 CLUSTER_DISTANCE = 90  # 24×32=768 位里允许多少位不同
-MIN_GLYPH_HEIGHT = 20
-MAX_GLYPH_HEIGHT = 46
-MIN_GLYPH_WIDTH = 6
-MAX_GLYPH_WIDTH = 34
-MIN_ASPECT = 0.25
-MAX_ASPECT = 1.0
+SOURCES = ("cost", "cards")
 DEFAULT_OUT = Path("assets/templates/digit_templates.npz")
 DEFAULT_MONTAGE = Path("runs/phase2/preview/digit_clusters.png")
+DEFAULT_CARD_MONTAGE = Path("runs/phase2/preview/card_clusters.png")
 
 Mask = NDArray[np.bool_]
 
 
-def extract_glyphs(
-    image: NDArray[np.uint8], roi: tuple[int, int, int, int] = COST_ROI
-) -> list[Mask]:
-    """抠出一帧费用区里的数字块（左→右排序）。"""
+def collect_glyphs(records: Sequence[Mapping[str, Any]], source: str) -> list[Mask]:
+    """从帧里抠出指定区域的字形：`cost` = 右下费用区，`cards` = 底部干员卡区。
 
-    x, y, w, h = roi
-    patch = image[y : y + h, x : x + w]
-    if patch.size == 0:
-        return []
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 80)).astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    found: list[tuple[int, Mask]] = []
-    for contour in contours:
-        bx, by, bw, bh = cv2.boundingRect(contour)
-        if not (MIN_GLYPH_HEIGHT <= bh <= MAX_GLYPH_HEIGHT):
+    字形抠取复用 `arknights_agent.perception.ocr` 的实现——工具与推理必须用同一套
+    ROI、阈值与归一化尺寸，否则模板和现场字形对不上。
+    """
+
+    extractor = extract_glyphs if source == "cost" else extract_card_glyphs
+    glyphs: list[Mask] = []
+    for record in records:
+        image = cv2.imread(str(record["screenshot"]))
+        if image is None:
             continue
-        if not (MIN_GLYPH_WIDTH <= bw <= MAX_GLYPH_WIDTH):
-            continue
-        if not (MIN_ASPECT <= bw / bh <= MAX_ASPECT):
-            continue
-        glyph = mask[by : by + bh, bx : bx + bw]
-        found.append((bx, cv2.resize(glyph, GLYPH_SIZE, interpolation=cv2.INTER_AREA) > 127))
-    found.sort(key=lambda item: item[0])
-    return [glyph for _, glyph in found]
+        glyphs.extend(extractor(image))
+    return glyphs
+
+
+def parse_labels(text: str | None) -> list[int] | None:
+    """解析 `--labels` / `--card-labels` 的逗号分隔簇标签。"""
+
+    if text is None:
+        return None
+    return [int(item) for item in text.split(",") if item.strip()]
 
 
 def cluster_glyphs(glyphs: Sequence[Mask]) -> list[dict[str, object]]:
@@ -136,12 +138,53 @@ def build_templates(
     return np.stack(templates)
 
 
+def write_templates(
+    path: Path,
+    built: Mapping[str, NDArray[np.bool_]],
+    audit: Mapping[str, dict[str, Any]],
+    *,
+    frames: int,
+) -> None:
+    """写 npz：`cost` → `templates`，`cards` → `card_templates`。
+
+    只写卡片模板时，先把已有 npz 里的费用模板读出来一起写回去——npz 是整文件覆盖，
+    不合并就会把费用模板冲掉。
+    """
+
+    payload: dict[str, Any] = {}
+    if "cost" not in built and path.is_file():
+        with np.load(path) as existing:
+            if "templates" in existing:
+                payload["templates"] = np.asarray(existing["templates"], dtype=bool)
+    if "cost" in built:
+        payload["templates"] = built["cost"]
+    if "cards" in built:
+        payload["card_templates"] = built["cards"]
+    if "templates" not in payload:
+        raise SystemExit(f"{path} 里没有费用模板：先用 --source cost 或 --source both 生成一次")
+    payload["source_frames"] = np.array(frames, dtype=np.int32)
+    for source, entry in audit.items():
+        prefix = "" if source == "cost" else "cards_"
+        payload[f"{prefix}cluster_labels"] = np.array(entry["labels"], dtype=np.int16)
+        payload[f"{prefix}cluster_sizes"] = np.array(entry["sizes"], dtype=np.int32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **payload)
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="从战斗帧提取数字模板")
     parser.add_argument("--annotation", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=200, help="用多少帧做提取")
-    parser.add_argument("--labels", default=None, help="逗号分隔的簇→数字映射，如 7,6,1,8,5,0,...")
+    parser.add_argument(
+        "--source",
+        choices=("cost", "cards", "both"),
+        default="cost",
+        help="抠哪个区域的字形：cost=右下费用区，cards=底部干员卡，both=两个都做",
+    )
+    parser.add_argument("--labels", default=None, help="费用区的簇→数字映射，如 7,6,1,8,5,0,...")
+    parser.add_argument("--card-labels", default=None, help="卡片区的簇→数字映射（同上格式）")
     parser.add_argument("--montage", type=Path, default=DEFAULT_MONTAGE)
+    parser.add_argument("--card-montage", type=Path, default=DEFAULT_CARD_MONTAGE)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     return parser.parse_args(argv)
 
@@ -150,36 +193,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     data = json.loads(args.annotation.read_text(encoding="utf-8"))
     records = [item for item in data["records"] if item.get("result") == "ok"][: args.frames]
-    glyphs: list[Mask] = []
-    for record in records:
-        image = cv2.imread(str(record["screenshot"]))
-        if image is None:
-            continue
-        glyphs.extend(extract_glyphs(image))
-    clusters = cluster_glyphs(glyphs)
-    render_montage(clusters, args.montage)
-    print(f"从 {len(records)} 帧抠出 {len(glyphs)} 个数字块，聚成 {len(clusters)} 簇")
-    print(f"簇样本数：{[len(c['members']) for c in clusters]}")  # type: ignore[arg-type]
-    print(f"蒙太奇：{args.montage}")
-    if args.labels is None:
+    wanted = SOURCES if args.source == "both" else (args.source,)
+    label_args = {"cost": args.labels, "cards": args.card_labels}
+    montages = {"cost": args.montage, "cards": args.card_montage}
+    flag_names = {"cost": "--labels", "cards": "--card-labels"}
+
+    built: dict[str, NDArray[np.bool_]] = {}
+    audit: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for source in wanted:
+        glyphs = collect_glyphs(records, source)
+        clusters = cluster_glyphs(glyphs)
+        sizes = [len(cluster["members"]) for cluster in clusters]  # type: ignore[arg-type]
+        render_montage(clusters, montages[source])
         print(
-            "请查看蒙太奇后传入 --labels（按簇号顺序写数字），例如 --labels 7,6,1,8,5,0,2,4,3,9,0"
+            f"[{source}] 从 {len(records)} 帧抠出 {len(glyphs)} 个数字块，聚成 {len(clusters)} 簇"
         )
+        print(f"[{source}] 簇样本数：{sizes}")
+        print(f"[{source}] 蒙太奇：{montages[source]}")
+        labels = parse_labels(label_args[source])
+        if labels is None:
+            missing.append(source)
+            continue
+        built[source] = build_templates(clusters, labels)
+        audit[source] = {"labels": labels, "sizes": sizes}
+
+    if missing:
+        for source in missing:
+            example = "7,6,1,8,5,0,2,4,3,9,0" if source == "cost" else "3,1,6,8,0,5,2,9,4,7"
+            print(
+                f"请先看蒙太奇，再用 {flag_names[source]} 传 {source} 区的簇→数字映射"
+                f"（簇号顺序，例如 {flag_names[source]} {example}）"
+            )
         return 0
-    labels = [int(item) for item in args.labels.split(",") if item.strip()]
-    templates = build_templates(clusters, labels)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.out,
-        templates=templates,
-        # 审计信息：簇顺序、各簇样本数、用了哪些帧。簇顺序变了但标签没跟着变，
-        # 是这套流程最容易踩的坑（会静默把 6 认成 7），所以把来源一并存下来。
-        cluster_labels=np.array(labels, dtype=np.int16),
-        cluster_sizes=np.array([len(c["members"]) for c in clusters], dtype=np.int32),  # type: ignore[arg-type]
-        source_frames=np.array(len(records), dtype=np.int32),
-    )
-    print(f"模板已保存：{args.out}（形状 {templates.shape}，按 0–9 顺序）")
-    print(f"审计：簇标签={labels}｜簇样本数={[len(c['members']) for c in clusters]}")  # type: ignore[arg-type]
+
+    write_templates(args.out, built, audit, frames=len(records))
+    shapes = {source: template.shape for source, template in built.items()}
+    print(f"模板已保存：{args.out}（形状 {shapes}，按 0–9 顺序）")
+    for source, entry in audit.items():
+        print(f"审计[{source}]：簇标签={entry['labels']}｜簇样本数={entry['sizes']}")
     return 0
 
 
