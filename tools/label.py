@@ -628,6 +628,32 @@ def save_annotation(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def set_reviewed(record: dict[str, Any], reviewed: bool | None = None) -> bool:
+    """标记/取消标记「这一帧已人工看过」；`reviewed=None` 表示切换。
+
+    返回标记后的状态。抽成模块级函数是为了能单测——空格键写没写进 JSON
+    只能靠这里 + :func:`save_annotation` 的组合来验证。
+    """
+
+    value = (not record.get("reviewed", False)) if reviewed is None else reviewed
+    record["reviewed"] = value
+    return value
+
+
+def unreviewed_index(records: Sequence[dict[str, Any]], start: int, step: int) -> int | None:
+    """从 `start + step` 起按 `step` 方向找第一张未标记 `reviewed` 的帧。
+
+    找不到（走到头或全部已检查）返回 None；`P` / `N` 两个快捷键走的就是这条路径。
+    """
+
+    index = start + step
+    while 0 <= index < len(records):
+        if not records[index].get("reviewed"):
+            return index
+        index += step
+    return None
+
+
 def pre_annotate(
     data: dict[str, Any],
     *,
@@ -908,18 +934,14 @@ def run_gui(annotation_path: Path, data: dict[str, Any]) -> int:
         render()
 
     def find_unreviewed(step: int) -> None:
-        index = state["index"] + step
-        while 0 <= index < len(viewable):
-            if not viewable[index].get("reviewed"):
-                state["index"] = index
-                state["selected"] = None
-                render()
-                return
-            index += step
+        target = unreviewed_index(viewable, state["index"], step)
+        if target is not None:
+            state["index"] = target
+            state["selected"] = None
+            render()
 
     def on_toggle_reviewed(*_: object) -> None:
-        record = current()
-        record["reviewed"] = not record.get("reviewed", False)
+        set_reviewed(current())
         state["dirty"] = True
         render()
 

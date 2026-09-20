@@ -36,7 +36,58 @@ def test_key_action_maps_required_shortcuts() -> None:
     assert label.key_action("t") == "toggle_ignored_neighbours"
     assert label.key_action("r") == "toggle_draw"
     assert label.key_action("s") == "save"
+    assert label.key_action("space") == "toggle_reviewed"
+    assert label.key_action("n") == "next_unreviewed"
+    assert label.key_action("p") == "prev_unreviewed"
     assert label.key_action("F5") is None
+
+
+def test_set_reviewed_toggles_the_flag() -> None:
+    """空格键走的路径：第一次标记、再按一次取消。"""
+
+    record: dict[str, Any] = {}
+
+    assert label.set_reviewed(record) is True
+    assert record["reviewed"] is True
+    assert label.set_reviewed(record) is False
+    assert record["reviewed"] is False
+    assert label.set_reviewed(record, True) is True
+
+
+def test_reviewed_flag_survives_save_and_reload(tmp_path: Path) -> None:
+    """回归：抽查时按空格标记的帧，保存后必须能在 JSON 里读回来。"""
+
+    target = tmp_path / "annotation.json"
+    data: dict[str, Any] = {
+        "artifact": "annotation",
+        "records": [
+            {"step": 1, "labels": [], "reviewed": False},
+            {"step": 2, "labels": []},
+        ],
+    }
+
+    label.set_reviewed(data["records"][1])
+    label.save_annotation(target, data)
+    reloaded = json.loads(target.read_text(encoding="utf-8"))
+
+    assert reloaded["records"][1]["reviewed"] is True
+    assert reloaded["records"][0]["reviewed"] is False
+
+
+def test_unreviewed_index_skips_reviewed_frames() -> None:
+    records = [
+        {"reviewed": True},
+        {"reviewed": True},
+        {"reviewed": False},
+        {"reviewed": True},
+        {},
+    ]
+
+    assert label.unreviewed_index(records, 0, 1) == 2
+    assert label.unreviewed_index(records, 3, 1) == 4
+    assert label.unreviewed_index(records, 4, 1) is None
+    assert label.unreviewed_index(records, 2, -1) is None
+    assert label.unreviewed_index(records, 4, -1) == 2
 
 
 def test_glow_fraction_flags_synthetic_glow() -> None:
